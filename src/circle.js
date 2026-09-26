@@ -1123,28 +1123,3 @@ export function getStoredWallet() {
       ),
   }
 }
-
-One required backend change
-
-This frontend expects:
-
-POST /api/session
-
-with:
-
-{
-  "action": "google",
-  "credential": "GOOGLE_ID_TOKEN",
-  "deviceId": "DEVICE_ID"
-}
-
-Your backend must verify the Google ID token before doing anything with the account. In particular, verify the token’s signature, issuer, audience, expiration, and email_verified claim. Do not simply decode the JWT and trust its payload.
-
-Also add these Vercel environment variables:
-
-VITE_GOOGLE_CLIENT_ID=51031114717-f9chve1ge9bbo8j3kspj82qrga40342n.apps.googleusercontent.com
-VITE_CIRCLE_APP_ID=518fec6a-4680-5175-9de6-0810fb3dfd04
-
-The Google client ID and Circle app ID can be public. Your Google client secret, Circle API key, Stablecoin Kit key, signing credentials, and other backend secrets must not be VITE_ variables and must never enter this file.
-
-One other production change is important: the ez_refresh_token should ideally move entirely server-side into an encrypted/httpOnly session rather than localStorage. The code above keeps it for compatibility with your current Circle social-refresh implementation, but that is the next security hardening step I’d make before calling the wallet production-ready.
