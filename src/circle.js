@@ -1,351 +1,1150 @@
 import { MOCK, MOCK_RATES } from './mock'
-
 let sdk = null
-
-// ⚡ LAZY-LOAD the Circle SDK (2026-07-17) - do NOT turn this back into `import { W3SSdk } from '...'` at the top.
-// Measured (vite build splits chunks per package): w3s-pw-web-sdk ITSELF is only 31 KB, but it DRAGS IN
-// firebase 262 KB + crypto-browserify 480 KB (elliptic/asn1/bn.js/diffie-hellman…, do polyfill
-// `crypto` in vite.config.js) = ~740 KB ≈ 60% of the bundle. A STATIC import here means any screen that imports
-// circle.js (HomeSend only needs ensureWalletAddress!) pulls all 740 KB into the first paint → a 2.7s white
-// screen on 4G. A dynamic import() → those 740 KB load only when a PIN signature is ACTUALLY needed.
+// ============================================================
+// CONFIG
+// ============================================================
+const API_BASE = ''
+// Google OAuth client ID.
+// This is PUBLIC configuration. Never put a Google client secret
+// in the frontend.
+export const GOOGLE_CLIENT_ID =
+  import.meta.env.VITE_GOOGLE_CLIENT_ID ||
+  '51031114717-f9chve1ge9bbo8j3kspj82qrga40342n.apps.googleusercontent.com'
+// Circle app ID is also public client configuration.
+const CIRCLE_APP_ID =
+  import.meta.env.VITE_CIRCLE_APP_ID ||
+  '518fec6a-4680-5175-9de6-0810fb3dfd04'
+// ============================================================
+// CIRCLE SDK
+// ============================================================
+//
+// IMPORTANT:
+// Do NOT statically import @circle-fin/w3s-pw-web-sdk.
+//
+// The SDK pulls Firebase + crypto-browserify into the initial
+// bundle. Lazy loading keeps the initial application lightweight.
+//
+// The SDK is loaded only when a Circle PIN/security challenge
+// actually needs to execute.
+//
 async function loadW3SSdk() {
   const m = await import('@circle-fin/w3s-pw-web-sdk')
   return m.W3SSdk
 }
-
-// ⚠️ Circle SDK localization: setLocalizations is no longer called (dropped 2026-08-25 along with the i18n layer).
-// The app is English-only, and English is Circle's OWN DEFAULT → calling nothing is both correct and simplest
-// (the PIN screen + security questions come out in English). To do multi-language again: see circleLocalizations.js
-// in git history (the commit before the i18n removal) for both the translations and the correct positional-argument call.
-// ⚠️ ASYNC (changed 2026-07-17 when the SDK became lazy) - EVERY call site MUST `await getSDK()`.
-// Forgetting the await → a Promise is passed where the real SDK is expected → the PIN dies silently. All 6 call sites were fixed:
-// EnterEmail(×3), PinGate, Security, SendConfirm, Swap.
 export async function getSDK() {
-  if (MOCK) return {}   // mock: do not init the real SDK
+  if (MOCK) return {}
   if (!sdk) {
     const W3SSdk = await loadW3SSdk()
-    sdk = new W3SSdk({ appSettings: { appId: '518fec6a-4680-5175-9de6-0810fb3dfd04' } })
+    sdk = new W3SSdk({
+      appSettings: {
+        appId: CIRCLE_APP_ID,
+      },
+    })
   }
   return sdk
 }
-
-export const GOOGLE_CLIENT_ID = '51031114717-f9chve1ge9bbo8j3kspj82qrga40342n.apps.googleusercontent.com'
-
-export async function createSocialToken(deviceId) {
-  const res = await fetch('/api/session', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'socialToken', deviceId }),
-  })
-  const data = await res.json()
-  if (data.error) throw new Error(data.error)
-  return data
-}
-
-export async function createSession(email) {
-  const res = await fetch('/api/session', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email }),
-  })
-  const data = await res.json()
-  if (data.error) throw new Error(data.error)
-  return data
-}
-
-// Verify the PIN to UNLOCK THE WALLET (access is gated by the Circle PIN itself - no second code invented). Create a challenge
-// signing an empty message; executeChallenge then opens the PIN screen. A successful signature = correct PIN = wallet unlocked.
-export async function signMessageChallenge(userToken, walletId, message = 'Unlock ezwallet') {
-  const res = await fetch('/api/wallet', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'signMessage', userToken, walletId, message }),
-  })
-  const data = await res.json()
-  if (data.error) throw new Error(data.error)
-  return data.challengeId
-}
-
-// Email OTP: mails the code + returns { otpToken, deviceToken, deviceEncryptionKey } for sdk.verifyOtp().
-export async function createEmailToken(deviceId, email) {
-  const res = await fetch('/api/session', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'emailToken', deviceId, email }),
-  })
-  const data = await res.json()
-  if (data.error) throw new Error(data.error)
-  return data
-}
-
-export async function initializeWallet(userToken) {
-  const res = await fetch('/api/wallet', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'initialize', userToken }),
-  })
-  const data = await res.json()
-  if (data.error) throw new Error(data.error)
-  return data
-}
-
-// Guarantee a wallet address: if localStorage is missing it (Circle provisioning lags at wallet creation),
-// fetch it again from the userToken and store it. A wallet needs NO USDC to have an address for receiving.
-export async function ensureWalletAddress() {
-  let addr = localStorage.getItem('ez_wallet_addr')
-  if (addr) return addr
-  const userToken = localStorage.getItem('ez_user_token')
-  if (!userToken) return null
+// ============================================================
+// HTTP HELPERS
+// ============================================================
+//
+// All application API calls go through this helper.
+//
+// Production improvements:
+// - credentials: include for secure httpOnly cookies
+// - timeout protection
+// - JSON validation
+// - consistent error handling
+// - no sensitive tokens written into request URLs
+//
+const REQUEST_TIMEOUT = 20_000
+async function apiRequest(path, options = {}) {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT)
   try {
-    const info = await getWalletAddress(userToken)
-    if (info?.address) {
-      localStorage.setItem('ez_wallet_addr', info.address)
-      if (info.walletId) localStorage.setItem('ez_wallet_id', info.walletId)
-      return info.address
-    }
-  } catch {}
-  return null
-}
-
-export async function getWalletAddress(userToken) {
-  try {
-    const res = await fetch('/api/wallet', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action: 'getAddress', userToken }),
+    const response = await fetch(`${API_BASE}${path}`, {
+      ...options,
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(options.headers || {}),
+      },
+      signal: controller.signal,
     })
-    const data = await res.json()
-    return data || null
-  } catch (e) {
-    console.error('[getWalletAddress error]', e)
+    const contentType = response.headers.get('content-type') || ''
+    let data
+    if (contentType.includes('application/json')) {
+      data = await response.json()
+    } else {
+      const text = await response.text()
+      data = text ? { message: text } : {}
+    }
+    if (!response.ok) {
+      const error = new Error(
+        data?.error ||
+        data?.message ||
+        `Request failed with status ${response.status}`,
+      )
+      error.status = response.status
+      error.code = data?.code
+      error.detail = data?.detail
+      throw error
+    }
+    if (data?.error) {
+      const error = new Error(data.error)
+      error.code = data.code
+      error.detail = data.detail
+      throw error
+    }
+    return data
+  } catch (error) {
+    if (error?.name === 'AbortError') {
+      throw new Error('Request timed out. Please check your connection and try again.')
+    }
+    throw error
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+// ============================================================
+// LOCAL SESSION HELPERS
+// ============================================================
+//
+// Production recommendation:
+// Prefer httpOnly secure cookies for authentication.
+//
+// These localStorage values are retained only for compatibility
+// with your existing Circle SDK architecture.
+//
+// Do NOT store Google access tokens or Google ID tokens here.
+//
+const STORAGE_KEYS = {
+  email: 'ez_email',
+  userToken: 'ez_user_token',
+  encryptionKey: 'ez_encryption_key',
+  walletAddress: 'ez_wallet_addr',
+  walletId: 'ez_wallet_id',
+  // Circle social-login refresh token.
+  // Ideally this should eventually move entirely server-side.
+  refreshToken: 'ez_refresh_token',
+  googleDeviceId: 'ez_google_deviceId',
+}
+function getStorage(key) {
+  try {
+    return localStorage.getItem(key)
+  } catch {
     return null
   }
 }
-
-// A Circle userToken only lives ~1 hour - far shorter than a real usage session for an
-// older user (open the app, go do something else, come back and send money). An expired token
-// makes the W3S SDK refuse RIGHT BEFORE showing the PIN screen → "userToken had expired",
-// and the user just gets thrown out with no idea why. Call this before ANY action
-// that needs a PIN signature (sending, changing the PIN) so the token is always fresh - Circle allows minting
-// a new one at any time given only the userId (= email), no password required.
-// Trade the refreshToken (returned by Circle at social login) for a new userToken. Used for Google users -
-// they have no userId=email, so they cannot mint a token with createSession.
-export async function refreshSocialToken(userToken, refreshToken, deviceId) {
-  const res = await fetch('/api/session', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'refreshSocial', userToken, refreshToken, deviceId }),
-  })
-  const data = await res.json()
-  if (data.error) { console.error('[refreshSocialToken]', data.error, data.detail); throw new Error(data.error) }
-  return data   // { userToken, encryptionKey, refreshToken }
+function setStorage(key, value) {
+  try {
+    if (value !== undefined && value !== null) {
+      localStorage.setItem(key, value)
+    }
+  } catch {
+    // Storage may be unavailable in privacy-restricted environments.
+  }
 }
-
+function removeStorage(key) {
+  try {
+    localStorage.removeItem(key)
+  } catch {
+    // Ignore storage failures.
+  }
+}
+function clearLocalSession() {
+  Object.values(STORAGE_KEYS).forEach(removeStorage)
+}
+// ============================================================
+// GOOGLE LOGIN
+// ============================================================
+//
+// IMPORTANT:
+// The Google credential must be verified by your backend.
+//
+// The frontend must NEVER:
+// - trust the email supplied by the browser
+// - accept an unverified Google profile
+// - store a Google client secret
+// - use a Google access token as your application session
+//
+// The backend should verify:
+//   aud
+//   iss
+//   exp
+//   email_verified
+//   sub
+//
+// Then the backend can create/restore the Circle social session.
+//
+export async function createGoogleSession({
+  credential,
+  deviceId,
+}) {
+  if (!credential) {
+    throw new Error('Google sign-in credential is required.')
+  }
+  return apiRequest('/api/session', {
+    method: 'POST',
+    body: JSON.stringify({
+      action: 'google',
+      // Google Identity Services returns this ID token as
+      // `credential`.
+      credential,
+      // Device ID is generated/maintained by the application.
+      deviceId: deviceId || getGoogleDeviceId(),
+    }),
+  })
+}
+// Backwards-compatible name if existing components call
+// createSocialToken().
+export async function createSocialToken(deviceId) {
+  return apiRequest('/api/session', {
+    method: 'POST',
+    body: JSON.stringify({
+      action: 'socialToken',
+      deviceId,
+    }),
+  })
+}
+// ============================================================
+// GOOGLE DEVICE ID
+// ============================================================
+export function getGoogleDeviceId() {
+  let deviceId = getStorage(STORAGE_KEYS.googleDeviceId)
+  if (deviceId) return deviceId
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    deviceId = crypto.randomUUID()
+  } else {
+    deviceId =
+      `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`
+  }
+  setStorage(STORAGE_KEYS.googleDeviceId, deviceId)
+  return deviceId
+}
+// ============================================================
+// EMAIL SESSION
+// ============================================================
+export async function createSession(email) {
+  if (!email || typeof email !== 'string') {
+    throw new Error('A valid email address is required.')
+  }
+  return apiRequest('/api/session', {
+    method: 'POST',
+    body: JSON.stringify({
+      action: 'session',
+      email: email.trim().toLowerCase(),
+    }),
+  })
+}
+// ============================================================
+// EMAIL OTP
+// ============================================================
+//
+// Returns:
+// {
+//   otpToken,
+//   deviceToken,
+//   deviceEncryptionKey
+// }
+// for Circle SDK verification.
+//
+export async function createEmailToken(deviceId, email) {
+  if (!deviceId) {
+    throw new Error('Device ID is required.')
+  }
+  if (!email) {
+    throw new Error('Email address is required.')
+  }
+  return apiRequest('/api/session', {
+    method: 'POST',
+    body: JSON.stringify({
+      action: 'emailToken',
+      deviceId,
+      email: email.trim().toLowerCase(),
+    }),
+  })
+}
+// ============================================================
+// WALLET
+// ============================================================
+export async function initializeWallet(userToken) {
+  if (!userToken) {
+    throw new Error('Missing wallet session.')
+  }
+  return apiRequest('/api/wallet', {
+    method: 'POST',
+    body: JSON.stringify({
+      action: 'initialize',
+      userToken,
+    }),
+  })
+}
+// ============================================================
+// WALLET ADDRESS
+// ============================================================
+export async function getWalletAddress(userToken) {
+  if (!userToken) return null
+  try {
+    return await apiRequest('/api/wallet', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'getAddress',
+        userToken,
+      }),
+    })
+  } catch (error) {
+    console.error('[getWalletAddress]', error)
+    return null
+  }
+}
+// Guarantee a wallet address.
+//
+// Circle wallet provisioning can occasionally lag behind wallet
+// creation. This function re-checks the backend rather than
+// assuming the wallet exists immediately.
+export async function ensureWalletAddress() {
+  const cachedAddress = getStorage(STORAGE_KEYS.walletAddress)
+  if (cachedAddress) {
+    return cachedAddress
+  }
+  const userToken = getStorage(STORAGE_KEYS.userToken)
+  if (!userToken) {
+    return null
+  }
+  try {
+    const info = await getWalletAddress(userToken)
+    if (info?.address) {
+      setStorage(STORAGE_KEYS.walletAddress, info.address)
+      if (info.walletId) {
+        setStorage(STORAGE_KEYS.walletId, info.walletId)
+      }
+      return info.address
+    }
+  } catch (error) {
+    console.error('[ensureWalletAddress]', error)
+  }
+  return null
+}
+// ============================================================
+// SESSION REFRESH
+// ============================================================
+//
+// Circle userTokens are short-lived.
+//
+// Email users:
+//   email -> backend -> fresh Circle userToken
+//
+// Google users:
+//   Circle refreshToken + deviceId -> backend -> fresh Circle
+//   userToken
+//
+// IMPORTANT:
+// A stale token is never silently treated as a successful refresh
+// by forceFreshSession().
+//
+export async function refreshSocialToken(
+  userToken,
+  refreshToken,
+  deviceId,
+) {
+  if (!refreshToken || !deviceId) {
+    throw new Error('Google session cannot be refreshed.')
+  }
+  const data = await apiRequest('/api/session', {
+    method: 'POST',
+    body: JSON.stringify({
+      action: 'refreshSocial',
+      userToken,
+      refreshToken,
+      deviceId,
+    }),
+  })
+  if (!data?.userToken) {
+    throw new Error('Circle did not return a new session.')
+  }
+  return data
+}
 export async function refreshSession() {
-  if (MOCK) return { userToken: 'mock-token', encryptionKey: 'mock-key' }
-  const email = localStorage.getItem('ez_email')
-  const fallback = { userToken: localStorage.getItem('ez_user_token'), encryptionKey: localStorage.getItem('ez_encryption_key') }
-
-  // EMAIL flow: mint a new token with userId = email (Circle allows it any time).
+  if (MOCK) {
+    return {
+      userToken: 'mock-token',
+      encryptionKey: 'mock-key',
+    }
+  }
+  const email = getStorage(STORAGE_KEYS.email)
+  const fallback = {
+    userToken: getStorage(STORAGE_KEYS.userToken),
+    encryptionKey: getStorage(STORAGE_KEYS.encryptionKey),
+  }
+  // ----------------------------------------------------------
+  // EMAIL ACCOUNT
+  // ----------------------------------------------------------
   if (email) {
     try {
-      const { userToken, encryptionKey } = await createSession(email)
-      localStorage.setItem('ez_user_token', userToken)
-      localStorage.setItem('ez_encryption_key', encryptionKey)
-      return { userToken, encryptionKey }
-    } catch {
+      const session = await createSession(email)
+      if (session?.userToken) {
+        setStorage(STORAGE_KEYS.userToken, session.userToken)
+      }
+      if (session?.encryptionKey) {
+        setStorage(
+          STORAGE_KEYS.encryptionKey,
+          session.encryptionKey,
+        )
+      }
+      return {
+        userToken: session.userToken,
+        encryptionKey: session.encryptionKey,
+      }
+    } catch (error) {
+      console.warn('[refreshSession email]', error)
       return fallback
     }
   }
-
-  // GOOGLE flow (no email → use the refreshToken + the deviceId saved at login).
-  // This is the root fix for the "Change PIN: Forbidden" error: the PIN userToken lives 60', and Google users
-  // previously had no way to refresh it → expiry → 403. Now the refreshToken buys a new token before PIN signing.
-  const refreshToken = localStorage.getItem('ez_refresh_token')
-  const deviceId = localStorage.getItem('ez_google_deviceId')
+  // ----------------------------------------------------------
+  // GOOGLE ACCOUNT
+  // ----------------------------------------------------------
+  const refreshToken = getStorage(STORAGE_KEYS.refreshToken)
+  const deviceId = getStorage(STORAGE_KEYS.googleDeviceId)
   if (refreshToken && deviceId) {
     try {
-      const r = await refreshSocialToken(fallback.userToken, refreshToken, deviceId)
-      if (r?.userToken) {
-        localStorage.setItem('ez_user_token', r.userToken)
-        if (r.encryptionKey) localStorage.setItem('ez_encryption_key', r.encryptionKey)
-        if (r.refreshToken) localStorage.setItem('ez_refresh_token', r.refreshToken)  // Circle rotates it → store the new one
-        return { userToken: r.userToken, encryptionKey: r.encryptionKey || fallback.encryptionKey }
+      const session = await refreshSocialToken(
+        fallback.userToken,
+        refreshToken,
+        deviceId,
+      )
+      if (session?.userToken) {
+        setStorage(
+          STORAGE_KEYS.userToken,
+          session.userToken,
+        )
       }
-    } catch {
-      // refreshToken expired (14 days) / network error → keep the old token and let the real error surface at execute
+      if (session?.encryptionKey) {
+        setStorage(
+          STORAGE_KEYS.encryptionKey,
+          session.encryptionKey,
+        )
+      }
+      // Circle may rotate the refresh token.
+      if (session?.refreshToken) {
+        setStorage(
+          STORAGE_KEYS.refreshToken,
+          session.refreshToken,
+        )
+      }
+      return {
+        userToken: session.userToken,
+        encryptionKey:
+          session.encryptionKey ||
+          fallback.encryptionKey,
+      }
+    } catch (error) {
+      console.warn('[refreshSession google]', error)
+      return fallback
     }
   }
   return fallback
 }
-
-// GUARANTEED fresh token - UNLIKE refreshSession (which silently returns the old token when createSession
-// fails → the root of error 155104). Used to RETRY when Circle reports an expired token. A failed mint throws out
-// (so the caller can send the user back to login) and is NOT swallowed.
+// ============================================================
+// FORCE FRESH SESSION
+// ============================================================
+//
+// Used after Circle reports:
+//   155103
+//   155104
+//   155105
+//
+// Unlike refreshSession(), failure is NOT swallowed.
+//
 export async function forceFreshSession() {
-  if (MOCK) return { userToken: 'mock-token', encryptionKey: 'mock-key' }
-  const email = localStorage.getItem('ez_email')
-  let s
+  if (MOCK) {
+    return {
+      userToken: 'mock-token',
+      encryptionKey: 'mock-key',
+    }
+  }
+  const email = getStorage(STORAGE_KEYS.email)
+  let session
+  // ----------------------------------------------------------
+  // EMAIL
+  // ----------------------------------------------------------
   if (email) {
-    s = await createSession(email)   // { userToken, encryptionKey } - throws on error
-  } else {
-    const refreshToken = localStorage.getItem('ez_refresh_token')
-    const deviceId = localStorage.getItem('ez_google_deviceId')
-    if (!refreshToken || !deviceId) throw new Error('no-session')   // not enough to mint → back to login
-    const r = await refreshSocialToken(localStorage.getItem('ez_user_token'), refreshToken, deviceId)
-    if (r.refreshToken) localStorage.setItem('ez_refresh_token', r.refreshToken)
-    s = { userToken: r.userToken, encryptionKey: r.encryptionKey }
+    session = await createSession(email)
   }
-  localStorage.setItem('ez_user_token', s.userToken)
-  localStorage.setItem('ez_encryption_key', s.encryptionKey)
-  return s
+  // ----------------------------------------------------------
+  // GOOGLE
+  // ----------------------------------------------------------
+  else {
+    const refreshToken = getStorage(STORAGE_KEYS.refreshToken)
+    const deviceId = getStorage(STORAGE_KEYS.googleDeviceId)
+    if (!refreshToken || !deviceId) {
+      throw new Error('no-session')
+    }
+    const refreshed = await refreshSocialToken(
+      getStorage(STORAGE_KEYS.userToken),
+      refreshToken,
+      deviceId,
+    )
+    if (!refreshed?.userToken) {
+      throw new Error('Circle did not return a new session.')
+    }
+    if (refreshed.refreshToken) {
+      setStorage(
+        STORAGE_KEYS.refreshToken,
+        refreshed.refreshToken,
+      )
+    }
+    session = {
+      userToken: refreshed.userToken,
+      encryptionKey: refreshed.encryptionKey,
+    }
+  }
+  if (!session?.userToken) {
+    throw new Error('Unable to create a new wallet session.')
+  }
+  setStorage(
+    STORAGE_KEYS.userToken,
+    session.userToken,
+  )
+  if (session.encryptionKey) {
+    setStorage(
+      STORAGE_KEYS.encryptionKey,
+      session.encryptionKey,
+    )
+  }
+  return session
 }
-
-// Circle reporting an expired/invalid session token: 155103 (token not found), 155104 (expired),
-// 155105 (invalid). SDK errors carry a numeric .code; errors from /api/* throw new Error(message) → match the text.
-export function isTokenExpiredError(e) {
-  const code = e?.code ?? e?.error?.code
-  if ([155103, 155104, 155105].includes(code)) return true
-  const msg = (e?.message || e?.error?.message || (typeof e === 'string' ? e : '')).toLowerCase()
-  return /155103|155104|155105|token had expired|usertoken is invalid/.test(msg)
+// ============================================================
+// TOKEN ERROR DETECTION
+// ============================================================
+export function isTokenExpiredError(error) {
+  const code =
+    error?.code ??
+    error?.error?.code
+  if ([155103, 155104, 155105].includes(code)) {
+    return true
+  }
+  const message = (
+    error?.message ||
+    error?.error?.message ||
+    (typeof error === 'string' ? error : '')
+  ).toLowerCase()
+  return /155103|155104|155105|token had expired|usertoken is invalid/.test(
+    message,
+  )
 }
-
-// KIT_KEY moved server-side (a Cloudflare Worker env var)
-// The browser only calls /api/swap, and the Worker talks to the Circle Stablecoin Kit API
-
-// MOCK: estimate the conversion from MOCK_RATES (USD per unit): amountOut = amountIn·rateIn/rateOut
+// ============================================================
+// SIGN MESSAGE
+// ============================================================
+//
+// Creates a Circle challenge used to unlock the wallet.
+//
+// The actual PIN is NEVER handled by this application.
+//
+export async function signMessageChallenge(
+  userToken,
+  walletId,
+  message = 'Unlock ezwallet',
+) {
+  if (!userToken) {
+    throw new Error('Missing wallet session.')
+  }
+  if (!walletId) {
+    throw new Error('Missing wallet ID.')
+  }
+  const data = await apiRequest('/api/wallet', {
+    method: 'POST',
+    body: JSON.stringify({
+      action: 'signMessage',
+      userToken,
+      walletId,
+      message,
+    }),
+  })
+  if (!data?.challengeId) {
+    throw new Error('Circle did not return a signing challenge.')
+  }
+  return data.challengeId
+}
+// ============================================================
+// SWAP
+// ============================================================
+//
+// KIT_KEY remains server-side.
+//
+// Browser:
+//   /api/swap
+//
+// Worker/backend:
+//   Circle Stablecoin Kit
+//
 function mockSwapOut(tokenIn, tokenOut, amountIn) {
-  const rIn = MOCK_RATES[tokenIn] ?? 1, rOut = MOCK_RATES[tokenOut] ?? 1
-  return String((Number(amountIn) * rIn / rOut).toFixed(6))
+  const rIn = MOCK_RATES[tokenIn] ?? 1
+  const rOut = MOCK_RATES[tokenOut] ?? 1
+  return String(
+    (
+      Number(amountIn) *
+      rIn /
+      rOut
+    ).toFixed(6),
+  )
 }
-
-export async function estimateSwap({ walletAddress, tokenIn, tokenOut, amountIn }) {
-  if (MOCK) return { amountOut: mockSwapOut(tokenIn, tokenOut, amountIn) }
-  const res = await fetch('/api/swap', {
+export async function estimateSwap({
+  walletAddress,
+  tokenIn,
+  tokenOut,
+  amountIn,
+}) {
+  if (MOCK) {
+    return {
+      amountOut: mockSwapOut(
+        tokenIn,
+        tokenOut,
+        amountIn,
+      ),
+    }
+  }
+  return apiRequest('/api/swap', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'estimate', walletAddress, tokenIn, tokenOut, amountIn }),
+    body: JSON.stringify({
+      action: 'estimate',
+      walletAddress,
+      tokenIn,
+      tokenOut,
+      amountIn,
+    }),
   })
-  return res.json()
 }
-
-// The userToken is passed in from refreshSession() (do not read localStorage directly - a 60' token may be dead)
-export async function executeSwap({ userToken, walletId, walletAddress, tokenIn, tokenOut, amountIn }) {
-  if (MOCK) return { challengeId: 'mock-challenge', amountOut: mockSwapOut(tokenIn, tokenOut, amountIn) }
-  const res = await fetch('/api/swap', {
+export async function executeSwap({
+  userToken,
+  walletId,
+  walletAddress,
+  tokenIn,
+  tokenOut,
+  amountIn,
+}) {
+  if (MOCK) {
+    return {
+      challengeId: 'mock-challenge',
+      amountOut: mockSwapOut(
+        tokenIn,
+        tokenOut,
+        amountIn,
+      ),
+    }
+  }
+  if (!userToken) {
+    throw new Error('Missing wallet session.')
+  }
+  return apiRequest('/api/swap', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'execute', userToken, walletId, walletAddress, tokenIn, tokenOut, amountIn }),
+    body: JSON.stringify({
+      action: 'execute',
+      userToken,
+      walletId,
+      walletAddress,
+      tokenIn,
+      tokenOut,
+      amountIn,
+    }),
   })
-  return res.json()
 }
-
-
+// ============================================================
+// PIN MANAGEMENT
+// ============================================================
 export async function resetPinChallenge(userToken) {
-  const res = await fetch('/api/wallet', {
+  if (!userToken) {
+    throw new Error('Missing wallet session.')
+  }
+  const data = await apiRequest('/api/wallet', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'resetPin', userToken }),
+    body: JSON.stringify({
+      action: 'resetPin',
+      userToken,
+    }),
   })
-  const data = await res.json()
-  if (data.error) {
-    console.error('[resetPinChallenge]', data.error, data.detail)
-    throw new Error(data.error)
+  if (!data?.challengeId) {
+    throw new Error('Circle did not return a PIN reset challenge.')
   }
   return data.challengeId
 }
-
-// FORGOT PIN - skips the old PIN, Circle verifies the security questions instead (see resetPinChallenge
-// above for the "3 PIN endpoints" comment in functions/api/wallet.js - this is the 3rd one).
+// Forgot PIN.
+//
+// Circle verifies the security questions rather than requiring
+// the previous PIN.
 export async function restorePinChallenge(userToken) {
-  const res = await fetch('/api/wallet', {
+  if (!userToken) {
+    throw new Error('Missing wallet session.')
+  }
+  const data = await apiRequest('/api/wallet', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'restorePin', userToken }),
+    body: JSON.stringify({
+      action: 'restorePin',
+      userToken,
+    }),
   })
-  const data = await res.json()
-  if (data.error) {
-    console.error('[restorePinChallenge]', data.error, data.detail)
-    throw new Error(data.error)
+  if (!data?.challengeId) {
+    throw new Error(
+      'Circle did not return a PIN recovery challenge.',
+    )
   }
   return data.challengeId
 }
-
-// ⚠️ Circle error codes where the iframe KEEPS the modal open for the user to correct themselves (it does NOT close).
-// If we reject the promise on these and navigate away → when the user then enters the RIGHT value,
-// the iframe (still on top) fires onComplete success BUT the promise is already rejected → the result is lost
-// → the user is "thrown out" despite entering it correctly. This IS the root cause of the PIN bug.
-// → Ignore these errors (let the iframe handle the retry); ONLY settle on SUCCESS or a TERMINAL error.
-// (Source: reading @circle-fin/w3s-pw-web-sdk messageHandler - onError does NOT remove the iframe.)
+// ============================================================
+// CIRCLE ERROR HANDLING
+// ============================================================
 const RETRYABLE_CODES = new Set([
-  155112, // incorrectUserPin - wrong PIN, the iframe allows a retry
-  155703, // pinCodeNotMatched - the 2 PIN entries (when creating one) do not match
-  155704, // insecurePinCode - PIN too weak, pick another
-  155115, // incorrectSecurityAnswers - wrong security answers
-  155705, // hintsMatchAnswers - the hint matches the answer
+  155112, // incorrectUserPin
+  155703, // pinCodeNotMatched
+  155704, // insecurePinCode
+  155115, // incorrectSecurityAnswers
+  155705, // hintsMatchAnswers
 ])
-
-// ⚠️⚠️ THE CIRCLE ERROR BOUNDARY - READ BEFORE CHANGING ANYTHING (established 2026-08-04 by reading the SDK source):
-// Circle errors come in TWO KINDS, and only one of them is ours to word:
-//
-//   (a) Errors DRAWN INSIDE THE IFRAME (RETRYABLE_CODES above: wrong PIN, wrong answers...) - the
-//       `pw-auth.circle.com` iframe shows its own red text and allows a retry, does NOT close and does NOT surface anything.
-//       That text is Circle's, in ENGLISH, and CANNOT BE CHANGED: the `Localizations` interface has EXACTLY 16
-//       fields (see `node_modules/@circle-fin/w3s-pw-web-sdk/dist/src/types.d.ts:498`), none of them for error
-//       text; the only thing named "error" is `errorInfo` in `Resources`, and that is an image ICON. This is a REAL
-//       Circle limitation - stop looking for a way to reword it.
-//
-//   (b) TERMINAL errors (PIN locked, token expired...) - the iframe CLOSES, the error surfaces here, and WE draw it
-//       on screen. These we CAN word → mapped by `err.code` below.
-//
-// Mapped by NUMERIC CODE, never by matching English text (`/lock/i` as the old version did): if Circle localises the
-// message or rewords it, text matching goes silent, whereas the codes are stable.
 const ERROR_BY_CODE = {
-  155119: 'Too many incorrect PIN attempts. Your wallet is temporarily locked – please try again in a few minutes.',
-  155120: 'Too many incorrect answers. Temporarily locked – please try again in a few minutes.',
-  155109: 'This account has been disabled.',
-  155102: 'Account not found.',
-  155110: 'This account has no PIN set.',
-  155111: 'This account has no security questions set.',
-  155103: 'Your session has expired. Please sign in again.',
-  155104: 'Your session has expired. Please sign in again.',
-  155105: 'Your session has expired. Please sign in again.',
-  155130: 'The code has expired. Please request a new one.',
-  155131: 'Invalid code.',
-  155133: 'Incorrect code.',
-  155134: 'The code does not match.',
-  155706: 'Network error. Check your connection and try again.',
+  155119:
+    'Too many incorrect PIN attempts. Your wallet is temporarily locked. Please try again in a few minutes.',
+  155120:
+    'Too many incorrect answers. Your wallet is temporarily locked. Please try again in a few minutes.',
+  155109:
+    'This account has been disabled.',
+  155102:
+    'Account not found.',
+  155110:
+    'This account has no PIN set.',
+  155111:
+    'This account has no security questions set.',
+  155103:
+    'Your session has expired. Please sign in again.',
+  155104:
+    'Your session has expired. Please sign in again.',
+  155105:
+    'Your session has expired. Please sign in again.',
+  155130:
+    'The code has expired. Please request a new one.',
+  155131:
+    'Invalid code.',
+  155133:
+    'Incorrect code.',
+  155134:
+    'The code does not match.',
+  155706:
+    'Network error. Check your connection and try again.',
 }
-
-// A Circle error → the sentence shown to the user. An unknown code (not in the table) → fall back to Circle's own
-// message rather than swallowing the information; failing that, a generic sentence.
-// USE THIS FUNCTION everywhere a Circle error is caught, never read `e.message` directly.
-export function circleErrorMessage(e) {
-  const known = ERROR_BY_CODE[e?.code ?? e?.error?.code]
-  if (known) return known
-  return e?.message || e?.error?.message || (typeof e === 'string' ? e : '') || 'Something went wrong'
+export function circleErrorMessage(error) {
+  const code =
+    error?.code ??
+    error?.error?.code
+  const known = ERROR_BY_CODE[code]
+  if (known) {
+    return known
+  }
+  return (
+    error?.message ||
+    error?.error?.message ||
+    (typeof error === 'string' ? error : '') ||
+    'Something went wrong'
+  )
 }
-
-export function executeChallenge(sdk, userToken, encryptionKey, challengeId) {
-  if (MOCK) return Promise.resolve()   // mock: skip PIN signing, treat it as a success
+// ============================================================
+// EXECUTE CIRCLE CHALLENGE
+// ============================================================
+//
+// IMPORTANT:
+// Retryable errors MUST NOT reject the promise.
+//
+// Circle's cross-origin PIN iframe remains open when the user
+// enters an incorrect PIN/security answer.
+//
+// Rejecting here would cause the parent application to navigate
+// away while Circle is still waiting for another attempt.
+//
+export function executeChallenge(
+  sdkInstance,
+  userToken,
+  encryptionKey,
+  challengeId,
+) {
+  if (MOCK) {
+    return Promise.resolve()
+  }
+  if (!sdkInstance) {
+    return Promise.reject(
+      new Error('Circle SDK is not initialized.'),
+    )
+  }
+  if (!userToken || !encryptionKey || !challengeId) {
+    return Promise.reject(
+      new Error('Invalid Circle challenge session.'),
+    )
+  }
   return new Promise((resolve, reject) => {
-    sdk.setAuthentication({ userToken, encryptionKey })
-    sdk.execute(challengeId, (err, result) => {
-      if (err) {
-        // Log EVERY Circle error WITH ITS CODE. Without this line, retryable errors (wrong PIN) are swallowed
-        // silently below → there is no way to know which code Circle actually sends, leaving you guessing
-        // (3 deploy cycles were lost to guessing, 08-04). Keep it forever: it is cheap, and it is the only
-        // window into a cross-origin iframe.
-        console.error('[Circle challenge]', 'code=', err?.code, '| retryable=', RETRYABLE_CODES.has(err?.code), '|', err?.message || err?.error?.message, err)
-        if (RETRYABLE_CODES.has(err.code)) return   // let the iframe offer a retry, do not settle
-        // A terminal error → attach the human sentence to .message (callers keep showing .message as before).
-        // 155119 = PIN locked: keep the .locked flag for callers that need to tell it apart.
-        return reject(Object.assign(new Error(circleErrorMessage(err)), {
-          code: err.code,
-          locked: err.code === 155119 || err.code === 155120,
-        }))
-      }
-      resolve(result)
-    })
+    try {
+      sdkInstance.setAuthentication({
+        userToken,
+        encryptionKey,
+      })
+      sdkInstance.execute(
+        challengeId,
+        (error, result) => {
+          if (error) {
+            const code =
+              error?.code ??
+              error?.error?.code
+            console.error(
+              '[Circle challenge]',
+              'code=',
+              code,
+              '| retryable=',
+              RETRYABLE_CODES.has(code),
+              '|',
+              error?.message ||
+                error?.error?.message,
+            )
+            // Circle's iframe stays open.
+            //
+            // DO NOT reject.
+            if (RETRYABLE_CODES.has(code)) {
+              return
+            }
+            const wrapped = Object.assign(
+              new Error(
+                circleErrorMessage(error),
+              ),
+              {
+                code,
+                locked:
+                  code === 155119 ||
+                  code === 155120,
+              },
+            )
+            reject(wrapped)
+            return
+          }
+          resolve(result)
+        },
+      )
+    } catch (error) {
+      reject(
+        Object.assign(
+          new Error(
+            circleErrorMessage(error),
+          ),
+          {
+            code:
+              error?.code ??
+              error?.error?.code,
+          },
+        ),
+      )
+    }
   })
 }
+// ============================================================
+// LOGOUT
+// ============================================================
+//
+// Clears local compatibility state.
+//
+// Production authentication should also invalidate the server
+// session through /api/session.
+//
+export async function logout() {
+  try {
+    await apiRequest('/api/session', {
+      method: 'POST',
+      body: JSON.stringify({
+        action: 'logout',
+      }),
+    })
+  } catch (error) {
+    console.warn('[logout]', error)
+  } finally {
+    clearLocalSession()
+    // Reset the lazy SDK instance so a subsequent login creates
+    // a fresh authentication context.
+    sdk = null
+  }
+}
+// ============================================================
+// SESSION STATUS
+// ============================================================
+//
+// Useful for app startup.
+//
+// Does NOT expose Google tokens.
+//
+export async function getSession() {
+  try {
+    return await apiRequest('/api/session', {
+      method: 'GET',
+    })
+  } catch (error) {
+    console.warn('[getSession]', error)
+    return {
+      authenticated: false,
+    }
+  }
+}
+// ============================================================
+// GOOGLE IDENTITY SERVICES HELPER
+// ============================================================
+//
+// Loads Google's browser SDK once.
+//
+// Your login component can call:
+//
+//   await initializeGoogleLogin({
+//     onCredential: async (credential) => {
+//       await createGoogleSession({ credential })
+//     }
+//   })
+//
+// The actual Google credential verification happens server-side.
+//
+let googleScriptPromise = null
+export function loadGoogleIdentityServices() {
+  if (typeof window === 'undefined') {
+    return Promise.reject(
+      new Error(
+        'Google Identity Services requires a browser.',
+      ),
+    )
+  }
+  if (window.google?.accounts?.id) {
+    return Promise.resolve(window.google)
+  }
+  if (googleScriptPromise) {
+    return googleScriptPromise
+  }
+  googleScriptPromise = new Promise(
+    (resolve, reject) => {
+      const existing = document.querySelector(
+        'script[src="https://accounts.google.com/gsi/client"]',
+      )
+      if (existing) {
+        existing.addEventListener(
+          'load',
+          () => resolve(window.google),
+          { once: true },
+        )
+        existing.addEventListener(
+          'error',
+          () =>
+            reject(
+              new Error(
+                'Unable to load Google Sign-In.',
+              ),
+            ),
+          { once: true },
+        )
+        return
+      }
+      const script =
+        document.createElement('script')
+      script.src =
+        'https://accounts.google.com/gsi/client'
+      script.async = true
+      script.defer = true
+      script.onload = () =>
+        resolve(window.google)
+      script.onerror = () =>
+        reject(
+          new Error(
+            'Unable to load Google Sign-In.',
+          ),
+        )
+      document.head.appendChild(script)
+    },
+  )
+  return googleScriptPromise
+}
+export async function initializeGoogleLogin({
+  onCredential,
+  buttonElement,
+  autoSelect = false,
+  cancelOnTapOutside = true,
+}) {
+  if (typeof onCredential !== 'function') {
+    throw new Error(
+      'Google login requires an onCredential callback.',
+    )
+  }
+  const google =
+    await loadGoogleIdentityServices()
+  if (
+    !google?.accounts?.id
+  ) {
+    throw new Error(
+      'Google Identity Services is unavailable.',
+    )
+  }
+  google.accounts.id.initialize({
+    client_id: GOOGLE_CLIENT_ID,
+    callback: async (response) => {
+      if (!response?.credential) {
+        console.error(
+          '[Google Login] Missing credential.',
+        )
+        return
+      }
+      try {
+        await onCredential(
+          response.credential,
+        )
+      } catch (error) {
+        console.error(
+          '[Google Login]',
+          error,
+        )
+      }
+    },
+    auto_select: autoSelect,
+    cancel_on_tap_outside:
+      cancelOnTapOutside,
+  })
+  if (buttonElement) {
+    google.accounts.id.renderButton(
+      buttonElement,
+      {
+        type: 'standard',
+        theme: 'outline',
+        size: 'large',
+        text: 'continue_with',
+        shape: 'rectangular',
+        width: 320,
+      },
+    )
+  }
+  return google
+}
+// ============================================================
+// SAFE GOOGLE LOGIN FLOW
+// ============================================================
+//
+// Convenience wrapper.
+//
+// Google:
+//   browser credential
+//        ↓
+//   /api/session
+//        ↓
+//   backend verifies Google token
+//        ↓
+//   Circle social session
+//        ↓
+//   application session
+//
+export async function loginWithGoogleCredential(
+  credential,
+) {
+  if (!credential) {
+    throw new Error(
+      'Google sign-in was not completed.',
+    )
+  }
+  const deviceId =
+    getGoogleDeviceId()
+  const session =
+    await createGoogleSession({
+      credential,
+      deviceId,
+    })
+  if (!session?.userToken) {
+    throw new Error(
+      'Google sign-in succeeded, but the wallet session could not be created.',
+    )
+  }
+  setStorage(
+    STORAGE_KEYS.userToken,
+    session.userToken,
+  )
+  if (session.encryptionKey) {
+    setStorage(
+      STORAGE_KEYS.encryptionKey,
+      session.encryptionKey,
+    )
+  }
+  if (session.refreshToken) {
+    setStorage(
+      STORAGE_KEYS.refreshToken,
+      session.refreshToken,
+    )
+  }
+  if (session.email) {
+    setStorage(
+      STORAGE_KEYS.email,
+      session.email,
+    )
+  }
+  if (session.walletId) {
+    setStorage(
+      STORAGE_KEYS.walletId,
+      session.walletId,
+    )
+  }
+  if (session.walletAddress) {
+    setStorage(
+      STORAGE_KEYS.walletAddress,
+      session.walletAddress,
+    )
+  }
+  return session
+}
+// ============================================================
+// EXPORTED SESSION UTILITIES
+// ============================================================
+export function getStoredSession() {
+  return {
+    email: getStorage(STORAGE_KEYS.email),
+    userToken:
+      getStorage(STORAGE_KEYS.userToken),
+    encryptionKey:
+      getStorage(
+        STORAGE_KEYS.encryptionKey,
+      ),
+    walletId:
+      getStorage(STORAGE_KEYS.walletId),
+    walletAddress:
+      getStorage(
+        STORAGE_KEYS.walletAddress,
+      ),
+    googleDeviceId:
+      getStorage(
+        STORAGE_KEYS.googleDeviceId,
+      ),
+  }
+}
+export function getStoredWallet() {
+  return {
+    walletId:
+      getStorage(STORAGE_KEYS.walletId),
+    walletAddress:
+      getStorage(
+        STORAGE_KEYS.walletAddress,
+      ),
+  }
+}
+
+One required backend change
+
+This frontend expects:
+
+POST /api/session
+
+with:
+
+{
+  "action": "google",
+  "credential": "GOOGLE_ID_TOKEN",
+  "deviceId": "DEVICE_ID"
+}
+
+Your backend must verify the Google ID token before doing anything with the account. In particular, verify the token’s signature, issuer, audience, expiration, and email_verified claim. Do not simply decode the JWT and trust its payload.
+
+Also add these Vercel environment variables:
+
+VITE_GOOGLE_CLIENT_ID=51031114717-f9chve1ge9bbo8j3kspj82qrga40342n.apps.googleusercontent.com
+VITE_CIRCLE_APP_ID=518fec6a-4680-5175-9de6-0810fb3dfd04
+
+The Google client ID and Circle app ID can be public. Your Google client secret, Circle API key, Stablecoin Kit key, signing credentials, and other backend secrets must not be VITE_ variables and must never enter this file.
+
+One other production change is important: the ez_refresh_token should ideally move entirely server-side into an encrypted/httpOnly session rather than localStorage. The code above keeps it for compatibility with your current Circle social-refresh implementation, but that is the next security hardening step I’d make before calling the wallet production-ready.
