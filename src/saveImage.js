@@ -1,4 +1,4 @@
-import logoLong from '../design/logo.svg'
+import logoLong from '../design/logo.png'
 
 // ══ BRANDED QR IMAGE - shared by EVERY place that shares a QR (user decision 08-13) ══
 // Takes a bare QR canvas → returns a new canvas: QR + the words "Only Arc Testnet" + the ezwallet logo.

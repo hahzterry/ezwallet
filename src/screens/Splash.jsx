@@ -1,4 +1,4 @@
-import logoLockup from '../../design/logo.svg'
+import logoLockup from '../../design/logo.png'
 import { GRADIENT } from '../brandBg'
 
 // SPLASH - Figma node 1:169. The loading screen: it appears while the app is still coming up, so it
