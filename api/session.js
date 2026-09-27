@@ -1,7 +1,8 @@
 import { initiateUserControlledWalletsClient } from '@circle-fin/user-controlled-wallets'
 
-const circle = createClient(process.env.CIRCLE_API_KEY)
-
+const circle = initiateUserControlledWalletsClient({
+  apiKey: process.env.CIRCLE_API_KEY,
+})
 export default async function handler(req, res) {
   if (req.method === 'GET') {
     // Session status
