@@ -1,197 +1,293 @@
+```javascript
+import crypto from 'crypto'
 import { initiateUserControlledWalletsClient } from '@circle-fin/user-controlled-wallets'
 
-// The SDK client is initialized but not used directly in this handler yet —
-// kept here so future branches (e.g. server-side wallet lookups) can use it
-// without re-importing. Circle's REST API is called via fetch() below.
-const circle = initiateUserControlledWalletsClient({
-  apiKey: process.env.CIRCLE_API_KEY,
-})
+// ─────────────────────────────────────────────────────────────
+// CIRCLE CONFIG
+// ─────────────────────────────────────────────────────────────
+
+const CIRCLE_API_KEY = process.env.CIRCLE_API_KEY
+
+if (!CIRCLE_API_KEY) {
+  console.error('[Circle] CIRCLE_API_KEY is missing')
+}
+
+// Initialize the SDK for future Circle SDK operations.
+const circle = CIRCLE_API_KEY
+  ? initiateUserControlledWalletsClient({
+      apiKey: CIRCLE_API_KEY,
+    })
+  : null
+
+// ─────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────
+
+function getDeviceId(email, deviceId) {
+  if (deviceId && typeof deviceId === 'string' && deviceId.trim()) {
+    return deviceId.trim()
+  }
+
+  return `mon-${Buffer.from(email.trim().toLowerCase())
+    .toString('hex')
+    .slice(0, 32)}`
+}
+
+async function circleRequest(endpoint, body) {
+  if (!CIRCLE_API_KEY) {
+    throw new Error(
+      'CIRCLE_API_KEY is not configured. Add it to the Vercel environment variables and redeploy.'
+    )
+  }
+
+  const response = await fetch(`https://api.circle.com${endpoint}`, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${CIRCLE_API_KEY}`,
+    },
+    body: JSON.stringify({
+      idempotencyKey: crypto.randomUUID(),
+      ...body,
+    }),
+  })
+
+  const data = await response.json().catch(() => ({}))
+
+  if (!response.ok) {
+    console.error('[Circle API Error]', {
+      endpoint,
+      status: response.status,
+      message: data?.message,
+      code: data?.code,
+    })
+
+    const error = new Error(
+      data?.message || `Circle API request failed with ${response.status}`
+    )
+
+    error.status = response.status
+    error.circleData = data
+
+    throw error
+  }
+
+  return data?.data || data
+}
+
+// ─────────────────────────────────────────────────────────────
+// HANDLER
+// ─────────────────────────────────────────────────────────────
 
 export default async function handler(req, res) {
-  // ── GET: session status ────────────────────────────────────────────────────
+  // ───────────────────────────────────────────────────────────
+  // GET: session status
+  // ───────────────────────────────────────────────────────────
+
   if (req.method === 'GET') {
-    return res.json({ authenticated: false })
+    return res.status(200).json({
+      authenticated: false,
+    })
   }
+
+  // ───────────────────────────────────────────────────────────
+  // POST ONLY
+  // ───────────────────────────────────────────────────────────
 
   if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' })
+    return res.status(405).json({
+      error: 'Method not allowed',
+    })
   }
 
-  const { action, email, credential, deviceId } = req.body || {}
+  const {
+    action,
+    email,
+    credential,
+    deviceId,
+    refreshToken,
+  } = req.body || {}
 
   try {
-    // ── EMAIL LOGIN ─────────────────────────────────────────────────────────
-    // ⚠️ Email login is a TWO-STEP flow in Circle:
-    //   1. Ask Circle to email a one-time code → returns deviceToken +
-    //      deviceEncryptionKey + otpToken. NO userToken yet.
-    //   2. The user enters the code in the Circle SDK iframe, which calls
-    //      verifyOtp() and only THEN yields a userToken + encryptionKey.
-    //
-    // ⚠️ Circle expects the field name `email`, NOT `userId`, and requires
-    //    `deviceId` to be a non-empty string.
+    // ─────────────────────────────────────────────────────────
+    // EMAIL LOGIN
+    // POST /v1/w3s/users/email/token
+    // ─────────────────────────────────────────────────────────
+
     if (action === 'session' || (!action && email)) {
-      if (!email) {
-        return res.status(400).json({ error: 'Email is required.' })
-      }
-
-      // Stable fallback deviceId if the frontend did not supply one.
-      const effectiveDeviceId =
-        deviceId || `mon-${Buffer.from(email).toString('hex').slice(0, 32)}`
-
-      const circleRes = await fetch(
-        'https://api.circle.com/v1/w3s/users/email/token',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${process.env.CIRCLE_API_KEY}`,
-          },
-          body: JSON.stringify({
-            idempotencyKey: crypto.randomUUID(),
-            email,
-            deviceId: effectiveDeviceId,
-          }),
-        }
-      )
-      const data = await circleRes.json()
-
-      if (!circleRes.ok) {
-        console.error('[api/session email]', data)
-        return res.status(circleRes.status).json({
-          error: data?.message || 'Unable to start email login.',
-          detail: data,
+      if (!email || typeof email !== 'string') {
+        return res.status(400).json({
+          error: 'Email is required.',
         })
       }
 
-      // Circle returns: { data: { deviceToken, deviceEncryptionKey, otpToken } }
-      // Flatten it so the frontend can read it directly.
-      return res.json(data.data || data)
+      const normalizedEmail = email.trim().toLowerCase()
+
+      if (!normalizedEmail.includes('@')) {
+        return res.status(400).json({
+          error: 'A valid email address is required.',
+        })
+      }
+
+      const effectiveDeviceId = getDeviceId(
+        normalizedEmail,
+        deviceId
+      )
+
+      const data = await circleRequest(
+        '/v1/w3s/users/email/token',
+        {
+          email: normalizedEmail,
+          deviceId: effectiveDeviceId,
+        }
+      )
+
+      return res.status(200).json(data)
     }
 
-    // ── EMAIL TOKEN (for SDK verifyOtp) ────────────────────────────────────
-    // Re-issues a fresh otpToken + deviceToken for the SDK's verifyOtp().
+    // ─────────────────────────────────────────────────────────
+    // EMAIL TOKEN
+    // Used before Circle SDK verifyOtp()
+    // ─────────────────────────────────────────────────────────
+
     if (action === 'emailToken') {
-      if (!email || !deviceId) {
-        return res.status(400).json({ error: 'Email and deviceId are required.' })
-      }
-
-      const circleRes = await fetch(
-        'https://api.circle.com/v1/w3s/users/email/token',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${process.env.CIRCLE_API_KEY}`,
-          },
-          body: JSON.stringify({
-            idempotencyKey: crypto.randomUUID(),
-            email,
-            deviceId,
-          }),
-        }
-      )
-      const data = await circleRes.json()
-
-      if (!circleRes.ok) {
-        console.error('[api/session emailToken]', data)
-        return res.status(circleRes.status).json({
-          error: data?.message || 'Unable to issue email token.',
-          detail: data,
+      if (!email || typeof email !== 'string') {
+        return res.status(400).json({
+          error: 'Email is required.',
         })
       }
 
-      return res.json(data.data || data)
+      if (!deviceId || typeof deviceId !== 'string') {
+        return res.status(400).json({
+          error: 'deviceId is required.',
+        })
+      }
+
+      const data = await circleRequest(
+        '/v1/w3s/users/email/token',
+        {
+          email: email.trim().toLowerCase(),
+          deviceId: deviceId.trim(),
+        }
+      )
+
+      return res.status(200).json(data)
     }
 
-    // ── GOOGLE LOGIN ────────────────────────────────────────────────────────
-    // ⚠️ NOT WIRED. Google login requires server-side verification of the
-    // ID token (signature, iss, aud, exp, email_verified). Until that exists,
-    // return 501 so a forged token can never "sign in".
+    // ─────────────────────────────────────────────────────────
+    // GOOGLE LOGIN
+    // ─────────────────────────────────────────────────────────
+
     if (action === 'google') {
-      console.warn('[api/session google] Google login not yet verified server-side.')
+      console.warn(
+        '[api/session google] Google login is not enabled server-side.'
+      )
+
       return res.status(501).json({
         error: 'Google login is not yet enabled on the server.',
       })
     }
 
-    // ── SOCIAL TOKEN (Circle SDK handoff) ───────────────────────────────────
-    // Used by createSocialToken() in circle.js for the Google SDK redirect flow.
+    // ─────────────────────────────────────────────────────────
+    // SOCIAL TOKEN
+    // ─────────────────────────────────────────────────────────
+
     if (action === 'socialToken') {
-      if (!deviceId) {
-        return res.status(400).json({ error: 'deviceId is required.' })
-      }
-
-      const circleRes = await fetch(
-        'https://api.circle.com/v1/w3s/users/social/token',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${process.env.CIRCLE_API_KEY}`,
-          },
-          body: JSON.stringify({
-            idempotencyKey: crypto.randomUUID(),
-            deviceId,
-          }),
-        }
-      )
-      const data = await circleRes.json()
-
-      if (!circleRes.ok) {
-        console.error('[api/session socialToken]', data)
-        return res.status(circleRes.status).json({
-          error: data?.message || 'Unable to start social login.',
-          detail: data,
+      if (!deviceId || typeof deviceId !== 'string') {
+        return res.status(400).json({
+          error: 'deviceId is required.',
         })
       }
 
-      return res.json(data.data || data)
+      const data = await circleRequest(
+        '/v1/w3s/users/social/token',
+        {
+          deviceId: deviceId.trim(),
+        }
+      )
+
+      return res.status(200).json(data)
     }
 
-    // ── REFRESH SOCIAL TOKEN ────────────────────────────────────────────────
-    // Trade the refreshToken for a fresh userToken (used by Google users).
+    // ─────────────────────────────────────────────────────────
+    // REFRESH SOCIAL TOKEN
+    // ─────────────────────────────────────────────────────────
+
     if (action === 'refreshSocial') {
-      const { refreshToken: rt } = req.body || {}
-      if (!rt || !deviceId) {
-        return res.status(400).json({ error: 'refreshToken and deviceId are required.' })
-      }
-
-      const circleRes = await fetch(
-        'https://api.circle.com/v1/w3s/users/token/refresh',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${process.env.CIRCLE_API_KEY}`,
-          },
-          body: JSON.stringify({
-            idempotencyKey: crypto.randomUUID(),
-            refreshToken: rt,
-            deviceId,
-          }),
-        }
-      )
-      const data = await circleRes.json()
-
-      if (!circleRes.ok) {
-        console.error('[api/session refreshSocial]', data)
-        return res.status(circleRes.status).json({
-          error: data?.message || 'Unable to refresh session.',
-          detail: data,
+      if (!refreshToken || typeof refreshToken !== 'string') {
+        return res.status(400).json({
+          error: 'refreshToken is required.',
         })
       }
 
-      return res.json(data.data || data)
+      if (!deviceId || typeof deviceId !== 'string') {
+        return res.status(400).json({
+          error: 'deviceId is required.',
+        })
+      }
+
+      const data = await circleRequest(
+        '/v1/w3s/users/token/refresh',
+        {
+          refreshToken: refreshToken.trim(),
+          deviceId: deviceId.trim(),
+        }
+      )
+
+      return res.status(200).json(data)
     }
 
-    // ── LOGOUT ──────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────
+    // LOGOUT
+    // ─────────────────────────────────────────────────────────
+
     if (action === 'logout') {
-      return res.json({ ok: true })
+      return res.status(200).json({
+        ok: true,
+      })
     }
 
-    return res.status(400).json({ error: 'Unknown action.' })
+    return res.status(400).json({
+      error: 'Unknown action.',
+    })
   } catch (error) {
-    console.error('[api/session]', error)
-    return res.status(500).json({ error: error.message })
+    console.error('[api/session]', {
+      message: error?.message,
+      status: error?.status,
+      circleCode: error?.circleData?.code,
+    })
+
+    // ─────────────────────────────────────────────────────────
+    // CIRCLE AUTH ERROR
+    // ─────────────────────────────────────────────────────────
+
+    if (error?.status === 401) {
+      return res.status(401).json({
+        error: 'Circle API authentication failed.',
+        detail:
+          error?.circleData?.message ||
+          'The CIRCLE_API_KEY is invalid, expired, or belongs to the wrong environment.',
+      })
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // OTHER CIRCLE ERROR
+    // ─────────────────────────────────────────────────────────
+
+    if (error?.status) {
+      return res.status(error.status).json({
+        error: error.message,
+        detail: error?.circleData,
+      })
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // SERVER ERROR
+    // ─────────────────────────────────────────────────────────
+
+    return res.status(500).json({
+      error: error?.message || 'Internal server error.',
+    })
   }
 }
