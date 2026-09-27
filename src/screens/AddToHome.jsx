@@ -77,7 +77,7 @@ export default function AddToHome() {
         width: '87.18%', textAlign: 'center',
         fontSize: 20, fontWeight: 'var(--fw-semibold)', lineHeight: '30px', color: 'var(--color-black)',
       }}>
-        <Ez />wallet works best as an app
+        <Mon />Yuny works best as an app
       </div>
 
       {/* Sub-title - node 48:357: 16px regular, line-height 24, centred on (195, 310.5). */}
@@ -86,7 +86,7 @@ export default function AddToHome() {
         width: '87.18%', textAlign: 'center',
         fontSize: 16, fontWeight: 'var(--fw-normal)', lineHeight: '24px', color: 'var(--color-black)',
       }}>
-        Add <Ez />wallet to your home screen:
+        Add <Mon />Yuny to your home screen:
       </div>
 
       {/* The two steps - box node 48:359 (340x70 @ 25,344, radius 8, #D2DCE6) with the list node 48:374
