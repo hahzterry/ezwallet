@@ -1,4 +1,4 @@
-import { createClient } from '@circle-fin/circle-sdk'
+import { initiateUserControlledWalletsClient } from '@circle-fin/user-controlled-wallets'
 
 const circle = createClient(process.env.CIRCLE_API_KEY)
 
