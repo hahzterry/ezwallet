@@ -30,9 +30,9 @@ const SHEET_ROWS = [
   { label: 'Add to Home Screen', icon: 'addSquare', blur: false },
 ]
 
-// "ez" is always brand blue inside a run of black text - the wordmark rule, applied in running copy.
-function Ez() {
-  return <span style={{ color: 'var(--color-brand)' }}>ez</span>
+// "Mon" is always brand blue inside a run of black text - the wordmark rule, applied in running copy.
+function Mon() {
+  return <span style={{ color: 'var(--color-brand)' }}>Mon</span>
 }
 
 export default function AddToHome() {
