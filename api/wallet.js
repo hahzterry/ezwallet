@@ -14,9 +14,8 @@ export default async function handler(req, res) {
 
   try {
     // ── INITIALIZE ──────────────────────────────────────────────────────────
-    // Create a wallet for this user. Circle returns a challengeId that the SDK
-    // must execute to set the user's first PIN. That challenge is what produces
-    // the wallet + walletId.
+    // Returns the SAME nested shape Circle does: { data: { challengeId } }
+    // so the frontend's `walletData?.data?.challengeId` reads it correctly.
     if (action === 'initialize') {
       if (!userToken) {
         return res.status(400).json({ error: 'Missing wallet session.' })
@@ -27,7 +26,7 @@ export default async function handler(req, res) {
         headers,
         body: JSON.stringify({
           idempotencyKey: crypto.randomUUID(),
-          blockchains: ['ARC-TESTNET'], // or ['ARC'] for mainnet
+          blockchains: ['ARC-TESTNET'], // change to ['ARC'] when going mainnet
           accountType: 'SCA',
         }),
       })
@@ -40,13 +39,13 @@ export default async function handler(req, res) {
         })
       }
 
-      // Flatten so the frontend reads { challengeId } directly
-      return res.json(data.data || data)
+      // ⚠️ Return the NESTED shape, not flattened.
+      return res.json(data)
     }
 
     // ── GET ADDRESS ─────────────────────────────────────────────────────────
-    // Fetch the user's wallet (address + walletId). Called AFTER the challenge
-    // has been executed (i.e. the PIN is set).
+    // Also returns the NESTED shape: { data: { wallets: [...] } }, matching
+    // Circle's own response. The frontend unwraps it via `info?.address`.
     if (action === 'getAddress') {
       if (!userToken) {
         return res.status(400).json({ error: 'Missing wallet session.' })
@@ -65,17 +64,21 @@ export default async function handler(req, res) {
       }
 
       const wallet = data?.data?.wallets?.[0]
-      if (!wallet) return res.json({})
+      if (!wallet) return res.json({ data: { wallets: [] } })
 
+      // Nest it so the frontend's getWalletAddress() can unwrap it the same way.
       return res.json({
-        walletId: wallet.id,
-        address: wallet.address,
-        blockchain: wallet.blockchain,
+        data: {
+          wallets: [{
+            id: wallet.id,
+            address: wallet.address,
+            blockchain: wallet.blockchain,
+          }],
+        },
       })
     }
 
     // ── SIGN MESSAGE ────────────────────────────────────────────────────────
-    // Creates a signing challenge. The SDK opens the PIN screen when it executes.
     if (action === 'signMessage') {
       if (!userToken || !walletId) {
         return res.status(400).json({ error: 'Missing wallet session.' })
@@ -99,7 +102,7 @@ export default async function handler(req, res) {
         })
       }
 
-      return res.json({ challengeId: data?.data?.challengeId })
+      return res.json({ data: { challengeId: data?.data?.challengeId } })
     }
 
     // ── RESET PIN ───────────────────────────────────────────────────────────
@@ -121,7 +124,7 @@ export default async function handler(req, res) {
         })
       }
 
-      return res.json({ challengeId: data?.data?.challengeId })
+      return res.json({ data: { challengeId: data?.data?.challengeId } })
     }
 
     // ── RESTORE PIN ─────────────────────────────────────────────────────────
@@ -143,7 +146,7 @@ export default async function handler(req, res) {
         })
       }
 
-      return res.json({ challengeId: data?.data?.challengeId })
+      return res.json({ data: { challengeId: data?.data?.challengeId } })
     }
 
     return res.status(400).json({ error: 'Unknown action.' })
