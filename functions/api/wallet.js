@@ -38,7 +38,7 @@ export async function onRequestPost(ctx) {
   // The wallet is an EOA, so it can sign messages immediately (no SCA lazy-deploy problem).
   if (action === 'signMessage') {
     const { status, data } = await circleReq('POST', '/user/sign/message',
-      { walletId: body.walletId, message: body.message || 'Unlock ezwallet', idempotencyKey: crypto.randomUUID() }, apiKey, userToken);
+      { walletId: body.walletId, message: body.message || 'Unlock Monyuny', idempotencyKey: crypto.randomUUID() }, apiKey, userToken);
     const challengeId = data?.data?.challengeId;
     if (!challengeId) {
       console.error('[signMessage] no challengeId:', status, JSON.stringify(data));

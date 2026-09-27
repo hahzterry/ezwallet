@@ -83,7 +83,7 @@ test('REPLAY: a spent nonce CANNOT be reused', async () => {
 
 test('a made-up nonce → 401, no token issued', async () => {
   const env = envWithKV()
-  const message = 'Unlock EZwallet. Nonce: 00000000-0000-0000-0000-000000000000'
+  const message = 'Unlock Monyuny. Nonce: 00000000-0000-0000-0000-000000000000'
   const signature = await me.signMessage({ message })
   const res = await call(env, { action: 'session', nonce: '00000000-0000-0000-0000-000000000000', signature })
   assert.equal(res.status, 401)

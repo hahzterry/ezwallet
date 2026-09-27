@@ -28,7 +28,7 @@ const ITEMS = [
   // frame anywhere in the file and no existing screen/route for it. Disabled - same standard as
   // "Withdraw" below (drawn, not yet wired) - until the user gives it a real screen to open.
   { id: 'LearnBlockchain', label: 'Learn about blockchain',   top: '65.28dvh', rule: '69.37dvh', disabled: true, icon: 'book' },
-  { id: 'About',      label: 'About ezwallet',                top: '75.47dvh', rule: '79.56dvh', icon: 'info' },
+  { id: 'About',      label: 'About Monyuny',                top: '75.47dvh', rule: '79.56dvh', icon: 'info' },
 ]
 
 // Row geometry - left/right markers at the standard 6.41% inset (matches every other card's side margin
@@ -75,7 +75,7 @@ export default function MenuScreen() {
           redesign is 16; this one is genuinely 8 in the node, kept as measured). Figma's example text
           ("kattyfury1403@gmail.com" / "Arc" / "0xabcd...efgh") is placeholder DATA, same as Send's
           "$10,000.00" - replaced with the real values, sourced exactly like Security.jsx already does.
-          "Arc Testnet" (not the placeholder's bare "Arc") matches the label used everywhere else in the
+          "Arc Mainnet" (not the placeholder's bare "Arc") matches the label used everywhere else in the
           app - About.jsx's Network row, NotifArea's network line. */}
       <div style={{
         position: 'absolute', left: '6.41%', top: '10.19dvh', width: '87.18%', height: '18.48dvh',

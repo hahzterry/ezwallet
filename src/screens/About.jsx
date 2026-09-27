@@ -17,11 +17,11 @@ const VERSION = '0.1.0'
 // only the shell + card colour (#D2DCE6 = var(--color-card), was --color-surface) to match Security/Menu.
 // Flag to the user if Figma is later filled in with different content than this.
 const ITEMS = [
-  { label: 'App', value: 'ezwallet', top: '14.34dvh' },
+  { label: 'App', value: 'Monyuny', top: '14.34dvh' },
   { label: 'Version', value: VERSION, top: '24.53dvh' },
-  { label: 'Network', value: 'Arc Testnet', top: '34.72dvh' },
+  { label: 'Network', value: 'Arc Mainnet', top: '34.72dvh' },
   { label: 'Wallet', value: 'Circle Wallet', top: '44.91dvh' },
-  { label: 'Github', link: 'https://github.com/KattyFury/ezwallet', top: '55.09dvh' },
+  { label: 'TikTok', link: 'https://tiktok.com/@monyuny', top: '55.09dvh' },
   { label: 'Term of use', link: 'https://www.circle.com/en/legal/privacy-policy', top: '65.28dvh' },
   { label: 'Privacy policy', link: 'https://www.circle.com/en/legal/privacy-policy', top: '75.47dvh' },
 ]

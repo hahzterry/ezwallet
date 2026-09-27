@@ -543,7 +543,7 @@ export function isTokenExpiredError(error) {
 export async function signMessageChallenge(
   userToken,
   walletId,
-  message = 'Unlock ezwallet',
+  message = 'Unlock Monyuny',
 ) {
   if (!userToken) {
     throw new Error('Missing wallet session.')
