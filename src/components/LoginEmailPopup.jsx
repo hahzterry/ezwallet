@@ -18,7 +18,7 @@ const APP_ID = '518fec6a-4680-5175-9de6-0810fb3dfd04'
 // TESTED (2026-07-05): OTP users sign with the Confirmation UI and have NO PIN → losing the guard against family
 // members + a "Contract Interaction" screen that baffles older users. → TURNED OFF, back to Email+PIN. Re-enable when
 // Circle lets social/OTP use a PIN (or the confirm UI can be customised properly). The OTP code stays, only this flag flips.
-const EMAIL_OTP_ENABLED = false
+const EMAIL_OTP_ENABLED = true
 
 function getEmailHistory() {
   try { return JSON.parse(localStorage.getItem('ez_email_history') || '[]') } catch { return [] }

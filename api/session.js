@@ -1,15 +1,14 @@
 import { initiateUserControlledWalletsClient } from '@circle-fin/user-controlled-wallets'
 
+// The SDK client is initialized but not used directly in this handler yet —
+// kept here so future branches (e.g. server-side wallet lookups) can use it
+// without re-importing. Circle's REST API is called via fetch() below.
 const circle = initiateUserControlledWalletsClient({
   apiKey: process.env.CIRCLE_API_KEY,
 })
 
 export default async function handler(req, res) {
   // ── GET: session status ────────────────────────────────────────────────────
-  // Used by getSession() in circle.js for app-startup checks. We do not yet
-  // persist server-side sessions (the frontend uses localStorage tokens), so
-  // this can only report "not authenticated". Replace with a real session store
-  // (e.g. httpOnly cookie + a DB row) when you move tokens off the browser.
   if (req.method === 'GET') {
     return res.json({ authenticated: false })
   }
@@ -22,21 +21,22 @@ export default async function handler(req, res) {
 
   try {
     // ── EMAIL LOGIN ─────────────────────────────────────────────────────────
-    // Frontend (circle.js → createSession) sends only { email }.
-    // Accept it both as a bare body and as { action: 'session', email }.
-    //
     // ⚠️ Email login is a TWO-STEP flow in Circle:
     //   1. Ask Circle to email a one-time code → returns deviceToken +
     //      deviceEncryptionKey + otpToken. NO userToken yet.
     //   2. The user enters the code in the Circle SDK iframe, which calls
     //      verifyOtp() and only THEN yields a userToken + encryptionKey.
     //
-    // So this endpoint cannot return a `userToken` by itself. The frontend
-    // must call sdk.verifyOtp({ otpToken, ... }) after this response.
+    // ⚠️ Circle expects the field name `email`, NOT `userId`, and requires
+    //    `deviceId` to be a non-empty string.
     if (action === 'session' || (!action && email)) {
       if (!email) {
         return res.status(400).json({ error: 'Email is required.' })
       }
+
+      // Stable fallback deviceId if the frontend did not supply one.
+      const effectiveDeviceId =
+        deviceId || `mon-${Buffer.from(email).toString('hex').slice(0, 32)}`
 
       const circleRes = await fetch(
         'https://api.circle.com/v1/w3s/users/email/token',
@@ -48,7 +48,8 @@ export default async function handler(req, res) {
           },
           body: JSON.stringify({
             idempotencyKey: crypto.randomUUID(),
-            userId: email,
+            email,
+            deviceId: effectiveDeviceId,
           }),
         }
       )
@@ -58,6 +59,7 @@ export default async function handler(req, res) {
         console.error('[api/session email]', data)
         return res.status(circleRes.status).json({
           error: data?.message || 'Unable to start email login.',
+          detail: data,
         })
       }
 
@@ -67,9 +69,7 @@ export default async function handler(req, res) {
     }
 
     // ── EMAIL TOKEN (for SDK verifyOtp) ────────────────────────────────────
-    // The SDK's verifyOtp() needs the deviceToken + otpToken from the step
-    // above, plus the code the user typed. This endpoint is a convenience
-    // re-issue if the frontend needs a fresh otpToken.
+    // Re-issues a fresh otpToken + deviceToken for the SDK's verifyOtp().
     if (action === 'emailToken') {
       if (!email || !deviceId) {
         return res.status(400).json({ error: 'Email and deviceId are required.' })
@@ -85,7 +85,7 @@ export default async function handler(req, res) {
           },
           body: JSON.stringify({
             idempotencyKey: crypto.randomUUID(),
-            userId: email,
+            email,
             deviceId,
           }),
         }
@@ -96,6 +96,7 @@ export default async function handler(req, res) {
         console.error('[api/session emailToken]', data)
         return res.status(circleRes.status).json({
           error: data?.message || 'Unable to issue email token.',
+          detail: data,
         })
       }
 
@@ -103,17 +104,9 @@ export default async function handler(req, res) {
     }
 
     // ── GOOGLE LOGIN ────────────────────────────────────────────────────────
-    // ⚠️ NOT WIRED. Before this can work, you MUST verify the Google ID token
-    // (`credential`) server-side:
-    //   - signature (fetch Google's JWKS)
-    //   - iss === 'https://accounts.google.com'
-    //   - aud === your GOOGLE_CLIENT_ID
-    //   - exp is in the future
-    //   - email_verified === true
-    // Only then should you look up / create a Circle user for that email.
-    //
-    // Until that verification exists, this branch returns 501 so it is
-    // impossible to accidentally "sign in" with a forged token.
+    // ⚠️ NOT WIRED. Google login requires server-side verification of the
+    // ID token (signature, iss, aud, exp, email_verified). Until that exists,
+    // return 501 so a forged token can never "sign in".
     if (action === 'google') {
       console.warn('[api/session google] Google login not yet verified server-side.')
       return res.status(501).json({
@@ -123,7 +116,6 @@ export default async function handler(req, res) {
 
     // ── SOCIAL TOKEN (Circle SDK handoff) ───────────────────────────────────
     // Used by createSocialToken() in circle.js for the Google SDK redirect flow.
-    // Circle expects the deviceId here, not an email.
     if (action === 'socialToken') {
       if (!deviceId) {
         return res.status(400).json({ error: 'deviceId is required.' })
@@ -149,6 +141,7 @@ export default async function handler(req, res) {
         console.error('[api/session socialToken]', data)
         return res.status(circleRes.status).json({
           error: data?.message || 'Unable to start social login.',
+          detail: data,
         })
       }
 
@@ -156,8 +149,7 @@ export default async function handler(req, res) {
     }
 
     // ── REFRESH SOCIAL TOKEN ────────────────────────────────────────────────
-    // Trade the refreshToken (returned by Circle at social login) for a fresh
-    // userToken. Used by Google users, who have no userId=email to mint with.
+    // Trade the refreshToken for a fresh userToken (used by Google users).
     if (action === 'refreshSocial') {
       const { refreshToken: rt } = req.body || {}
       if (!rt || !deviceId) {
@@ -185,6 +177,7 @@ export default async function handler(req, res) {
         console.error('[api/session refreshSocial]', data)
         return res.status(circleRes.status).json({
           error: data?.message || 'Unable to refresh session.',
+          detail: data,
         })
       }
 
@@ -192,8 +185,6 @@ export default async function handler(req, res) {
     }
 
     // ── LOGOUT ──────────────────────────────────────────────────────────────
-    // The frontend clears its own localStorage; there is no server session yet.
-    // This branch exists so circle.js's logout() does not 400.
     if (action === 'logout') {
       return res.json({ ok: true })
     }
