@@ -1,6 +1,4 @@
-```javascript
 import crypto from 'crypto'
-import { initiateUserControlledWalletsClient } from '@circle-fin/user-controlled-wallets'
 
 // ─────────────────────────────────────────────────────────────
 // CIRCLE CONFIG
@@ -8,36 +6,18 @@ import { initiateUserControlledWalletsClient } from '@circle-fin/user-controlled
 
 const CIRCLE_API_KEY = process.env.CIRCLE_API_KEY
 
-if (!CIRCLE_API_KEY) {
-  console.error('[Circle] CIRCLE_API_KEY is missing')
-}
-
-// Initialize the SDK for future Circle SDK operations.
-const circle = CIRCLE_API_KEY
-  ? initiateUserControlledWalletsClient({
-      apiKey: CIRCLE_API_KEY,
-    })
-  : null
+// Do NOT initialize the Circle SDK here.
+// This endpoint uses Circle's REST API directly.
 
 // ─────────────────────────────────────────────────────────────
-// HELPERS
+// CIRCLE REST REQUEST
 // ─────────────────────────────────────────────────────────────
-
-function getDeviceId(email, deviceId) {
-  if (deviceId && typeof deviceId === 'string' && deviceId.trim()) {
-    return deviceId.trim()
-  }
-
-  return `mon-${Buffer.from(email.trim().toLowerCase())
-    .toString('hex')
-    .slice(0, 32)}`
-}
 
 async function circleRequest(endpoint, body) {
   if (!CIRCLE_API_KEY) {
-    throw new Error(
-      'CIRCLE_API_KEY is not configured. Add it to the Vercel environment variables and redeploy.'
-    )
+    const error = new Error('CIRCLE_API_KEY is missing from Vercel.')
+    error.status = 500
+    throw error
   }
 
   const response = await fetch(`https://api.circle.com${endpoint}`, {
@@ -56,15 +36,9 @@ async function circleRequest(endpoint, body) {
   const data = await response.json().catch(() => ({}))
 
   if (!response.ok) {
-    console.error('[Circle API Error]', {
-      endpoint,
-      status: response.status,
-      message: data?.message,
-      code: data?.code,
-    })
-
     const error = new Error(
-      data?.message || `Circle API request failed with ${response.status}`
+      data?.message ||
+        `Circle API request failed with status ${response.status}`
     )
 
     error.status = response.status
@@ -77,12 +51,12 @@ async function circleRequest(endpoint, body) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// HANDLER
+// API HANDLER
 // ─────────────────────────────────────────────────────────────
 
 export default async function handler(req, res) {
   // ───────────────────────────────────────────────────────────
-  // GET: session status
+  // GET
   // ───────────────────────────────────────────────────────────
 
   if (req.method === 'GET') {
@@ -104,7 +78,6 @@ export default async function handler(req, res) {
   const {
     action,
     email,
-    credential,
     deviceId,
     refreshToken,
   } = req.body || {}
@@ -112,7 +85,6 @@ export default async function handler(req, res) {
   try {
     // ─────────────────────────────────────────────────────────
     // EMAIL LOGIN
-    // POST /v1/w3s/users/email/token
     // ─────────────────────────────────────────────────────────
 
     if (action === 'session' || (!action && email)) {
@@ -122,7 +94,15 @@ export default async function handler(req, res) {
         })
       }
 
+      if (!deviceId || typeof deviceId !== 'string') {
+        return res.status(400).json({
+          error:
+            'deviceId is required. The frontend must provide the Circle SDK deviceId.',
+        })
+      }
+
       const normalizedEmail = email.trim().toLowerCase()
+      const normalizedDeviceId = deviceId.trim()
 
       if (!normalizedEmail.includes('@')) {
         return res.status(400).json({
@@ -130,16 +110,17 @@ export default async function handler(req, res) {
         })
       }
 
-      const effectiveDeviceId = getDeviceId(
-        normalizedEmail,
-        deviceId
-      )
+      if (!normalizedDeviceId) {
+        return res.status(400).json({
+          error: 'deviceId cannot be empty.',
+        })
+      }
 
       const data = await circleRequest(
         '/v1/w3s/users/email/token',
         {
           email: normalizedEmail,
-          deviceId: effectiveDeviceId,
+          deviceId: normalizedDeviceId,
         }
       )
 
@@ -148,7 +129,6 @@ export default async function handler(req, res) {
 
     // ─────────────────────────────────────────────────────────
     // EMAIL TOKEN
-    // Used before Circle SDK verifyOtp()
     // ─────────────────────────────────────────────────────────
 
     if (action === 'emailToken') {
@@ -176,14 +156,10 @@ export default async function handler(req, res) {
     }
 
     // ─────────────────────────────────────────────────────────
-    // GOOGLE LOGIN
+    // GOOGLE / SOCIAL LOGIN
     // ─────────────────────────────────────────────────────────
 
     if (action === 'google') {
-      console.warn(
-        '[api/session google] Google login is not enabled server-side.'
-      )
-
       return res.status(501).json({
         error: 'Google login is not yet enabled on the server.',
       })
@@ -256,36 +232,40 @@ export default async function handler(req, res) {
       message: error?.message,
       status: error?.status,
       circleCode: error?.circleData?.code,
+      circleMessage: error?.circleData?.message,
     })
 
-    // ─────────────────────────────────────────────────────────
-    // CIRCLE AUTH ERROR
-    // ─────────────────────────────────────────────────────────
-
+    // Circle authentication failure
     if (error?.status === 401) {
       return res.status(401).json({
         error: 'Circle API authentication failed.',
         detail:
           error?.circleData?.message ||
-          'The CIRCLE_API_KEY is invalid, expired, or belongs to the wrong environment.',
+          'CIRCLE_API_KEY is invalid or belongs to the wrong Circle environment.',
       })
     }
 
-    // ─────────────────────────────────────────────────────────
-    // OTHER CIRCLE ERROR
-    // ─────────────────────────────────────────────────────────
+    // Missing API key
+    if (
+      error?.message ===
+      'CIRCLE_API_KEY is missing from Vercel.'
+    ) {
+      return res.status(500).json({
+        error: 'Circle is not configured.',
+        detail:
+          'CIRCLE_API_KEY is missing from the server environment.',
+      })
+    }
 
+    // Other Circle error
     if (error?.status) {
       return res.status(error.status).json({
         error: error.message,
-        detail: error?.circleData,
+        detail: error?.circleData || null,
       })
     }
 
-    // ─────────────────────────────────────────────────────────
-    // SERVER ERROR
-    // ─────────────────────────────────────────────────────────
-
+    // Unexpected server error
     return res.status(500).json({
       error: error?.message || 'Internal server error.',
     })
