@@ -6,7 +6,7 @@ import LoginEmailPopup from '../components/LoginEmailPopup'
 import { getCookie, setCookie, deleteCookie } from 'cookies-next'
 import { createSocialToken, initializeWallet, executeChallenge, getWalletAddress, GOOGLE_CLIENT_ID, circleErrorMessage } from '../circle'
 
-const APP_ID = '518fec6a-4680-5175-9de6-0810fb3dfd04'
+const APP_ID = '4fe094bb23dcbc99b61478055cfa1825:08b512ecd5160aac548249bdfc47dade'
 
 // Translate Circle error codes → a message that names the cause (instead of the baffling
 // "Failed to validate..." string). 155140 is almost always a redirect URI missing from the Circle Console
